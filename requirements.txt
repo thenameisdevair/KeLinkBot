@@ -1,0 +1,4 @@
+python-telegram-bot[asyncio]==22.1
+redis
+python-dotenv
+

@@ -1,0 +1,23 @@
+version: "3.8"
+
+services:
+  bot:
+    build: .
+    container_name: kelinkbot
+    env_file:
+      - .env                # uses your existing BOT_TOKEN line
+    environment:
+      - REDIS_URL=redis://redis:6379   # override so bot talks to the Redis service
+    restart: unless-stopped
+    depends_on:
+      - redis
+
+  redis:
+    image: redis:7
+    container_name: kelink-redis
+    restart: unless-stopped
+    volumes:
+      - redis-data:/data     # optional persistence
+
+volumes:
+  redis-data:
