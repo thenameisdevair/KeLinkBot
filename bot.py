@@ -1,4 +1,5 @@
-# bot.py — KeLinkBot v3.2  (grace window + strict interaction rule, event-loop safe)
+# bot.py — KeLinkBot v4.0 (strict 6-hour rule, no grace window)
+
 import os, re, logging, asyncio
 from datetime import datetime, timedelta, date
 import redis.asyncio as aioredis
@@ -13,14 +14,13 @@ from telegram.ext import (
 )
 
 # ── configuration & Redis ────────────────────────────────────────────────
-load_dotenv(override=False)        # don't overwrite variables set by Railway
-BOT_TOKEN  = os.getenv("BOT_TOKEN")                       # required
-REDIS_URL  = os.getenv("REDIS_URL", "redis://localhost:6379")
+load_dotenv(override=False)                               # keep Render vars
+BOT_TOKEN  = os.getenv("BOT_TOKEN")
+REDIS_URL  = os.getenv("REDIS_URL")                       # must be set by host
 redis_db   = aioredis.from_url(REDIS_URL, decode_responses=True)
 
-TTL_12H   = 43_200                         # 12 hours in seconds
-GRACE_KEY = "enforce_after"                # Redis key for grace-period end
-LINK_RE   = re.compile(r"https?://", re.I)
+TTL_LOOKBACK = 21_600      # 6 hours in seconds
+LINK_RE       = re.compile(r"https?://", re.I)
 
 # ── helper functions ────────────────────────────────────────────────────
 def seconds_to_midnight() -> int:
@@ -41,18 +41,16 @@ async def bump_daily_count(uid: int) -> int:
 
 async def mark_interaction(msg_id: int, uid: int):
     await redis_db.sadd(f"post:{msg_id}:interacted", uid)
-    await redis_db.expire(f"post:{msg_id}:interacted", TTL_12H)
+    await redis_db.expire(f"post:{msg_id}:interacted", TTL_LOOKBACK)
 
 async def has_fulfilled_rule(uid: int) -> bool:
-    """True if user has reacted/replied to every post in last 12 h (after grace)."""
+    """True if user has interacted with every wrapped post in last 6 h."""
     now = int(datetime.utcnow().timestamp())
-    enforce_after = int(await redis_db.get(GRACE_KEY) or (now + TTL_12H))
-    if now < enforce_after:
-        return True  # grace window still active
+    post_ids = await redis_db.zrangebyscore("posts_last6h", now - TTL_LOOKBACK, now)
 
-    post_ids = await redis_db.zrangebyscore("posts_last12h", now - TTL_12H, now)
     for pid in post_ids:
-        if await redis_db.get(f"post:{pid}:poster") == str(uid):
+        poster = await redis_db.get(f"post:{pid}:poster")
+        if poster == str(uid):
             continue  # skip their own posts
         if not await redis_db.sismember(f"post:{pid}:interacted", uid):
             return False
@@ -83,12 +81,12 @@ async def on_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # 2️⃣ strict interaction rule (after grace)
+    # 2️⃣ strict 6-hour interaction rule
     if not await has_fulfilled_rule(uid):
         await msg.delete()
         await ctx.bot.send_message(
             uid,
-            "👀 Before sharing, please react or reply to every link posted in the last 12 hours."
+            "👀 Before sharing, please react or reply to every link posted in the last 6 hours."
         )
         return
 
@@ -105,27 +103,17 @@ async def on_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await msg.delete()
 
     # 4️⃣ store metadata & interaction sets
-    await redis_db.setex(f"post:{wrapped.message_id}:poster", TTL_12H, uid)
+    await redis_db.setex(f"post:{wrapped.message_id}:poster", TTL_LOOKBACK, uid)
     await mark_interaction(wrapped.message_id, uid)  # poster counts as interacted
     await redis_db.zadd(
-        "posts_last12h",
+        "posts_last6h",
         {wrapped.message_id: int(datetime.utcnow().timestamp())},
     )
-    await redis_db.expire("posts_last12h", TTL_12H)
-
-# ── one-off: start / reset grace window ──────────────────────────────────
-def ensure_grace_window():
-    async def _inner():
-        if not await redis_db.exists(GRACE_KEY):
-            enforce_ts = int(datetime.utcnow().timestamp()) + TTL_12H
-            await redis_db.set(GRACE_KEY, enforce_ts)
-    asyncio.run(_inner())  # runs once; closes immediately
+    await redis_db.expire("posts_last6h", TTL_LOOKBACK)
 
 # ── main (single, self-owned loop) ───────────────────────────────────────
 def main():
     logging.basicConfig(level=logging.INFO)
-
-    ensure_grace_window()             # 12-hour grace timer starts now
 
     app = (
         Application.builder()
@@ -138,14 +126,13 @@ def main():
     app.add_handler(MessageHandler(filters.REPLY, on_reply))
     app.add_handler(MessageHandler(filters.TEXT, on_link))
 
-    # Create our own event loop (needed on Windows + Python 3.13)
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
     try:
         app.run_polling(
             allowed_updates=["message", "message_reaction"],
-            close_loop=False,          # don't auto-close our custom loop
+            close_loop=False,          # keep our loop open
         )
     finally:
         loop.close()
