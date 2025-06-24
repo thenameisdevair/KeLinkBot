@@ -13,7 +13,7 @@ from telegram.ext import (
 )
 
 # ── configuration & Redis ────────────────────────────────────────────────
-load_dotenv()
+load_dotenv(override=False)        # don't overwrite variables set by Railway
 BOT_TOKEN  = os.getenv("BOT_TOKEN")                       # required
 REDIS_URL  = os.getenv("REDIS_URL", "redis://localhost:6379")
 redis_db   = aioredis.from_url(REDIS_URL, decode_responses=True)
